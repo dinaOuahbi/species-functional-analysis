@@ -1,0 +1,432 @@
+---
+title: "Metagenomic Functional Analysis"
+author: "DO"
+output:
+  pdf_document: default
+  keep_tex: true
+  html_document: default
+date: "2024-08-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r lib load, echo = FALSE, message = FALSE, warning = FALSE, include = FALSE}
+library(ggplot2)
+library(ggpubr)
+library(tidyr)
+library(ComplexHeatmap)
+library(vegan)
+library(ape)
+library(momr)
+library(kableExtra)
+library(wesanderson)
+library(stringr)
+library(dplyr)
+library(readxl)
+library(svglite)
+library(data.table)
+library(grid)
+library(gridExtra)
+library(cowplot) # or library(patchwork)
+
+library(pROC)
+library(reshape2)
+library(ggplot2)
+library(momr)
+library(ggpubr)
+?testRelations2
+
+# FUNCTIONS  --------------------------------------------------------------------------
+source('~/projects/mgp_tools/scripts/ord_to_df.R') # convert ordinations (pcoa, nmds...) to ggplottable df
+source('~/projects/mgp_tools/scripts/plot_es.R') # plots the effect size, abundance and prevalence (v2)
+source('~/projects/mgp_tools/scripts/m4_taxonomy_shrink.R') # shrink taxonomy
+source('~/projects/mgp_tools/scripts/readRData.R') # read .RData format
+source('~/projects/mgp_tools/scripts/merge_msp_profiles.R')# merge msp oral/gut profiles
+source('~/projects/immunolife/scripts/utilities/legends_N.R') # add N to legends
+```
+
+# Introduction
+The idea is to focus on the genes and functional metabolic pathways associated with the use or non-use of antibiotics at two different time points:
+
+Before sampling
+Within a 60-40 window
+We are interested in two categorical variables for the comparative analysis of the modules:
+
+ATB_before_sample
+ATB_60_42
+The functional data comes from the Shrcan pipeline.
+
+
+```{r tax_data, echo = FALSE, message = FALSE, warning = FALSE, eval=T}
+kegg <- read.delim("/projects/programs/FAnToMet/all_modules_definition_GMM_GBM_KEGG_89.tsv")
+
+# TAXONUMY --------------------------------------------------------------------------
+msp_taxonomy_old <- readRData('/projects/biodatabank/catalogue/all_catalogue/human_MSP_set/latest/MSP_set_ref_oss_gss_status_612_ref_paper_20240627_gtdb_220.RData')
+msp_taxonomy_gut <- read.delim('/projects/biodatabank/catalogue/hs_10_4_igc2/mgs/latest/taxonomy/latest/hs_10_4_1990_MSP.20240626.gtdb_r220_annot_long.tsv')
+msp_taxonomy_oral <- read.delim('/projects/biodatabank/catalogue/hs_8_4_oral/mgs/latest/taxonomy/latest/hs_8_4_oral_853_MSP.20240627.gtdb_r220_annot_long.tsv')
+
+msp_taxonomy_all <- rbind(
+  mutate(msp_taxonomy_gut,ref_MSP_test='gut'),
+  mutate(msp_taxonomy_oral[!msp_taxonomy_oral$msp_name %in%msp_taxonomy_gut$msp_name, ], ref_MSP_test='oral')
+) 
+
+msp_taxonomy_all$ref_MSP <- msp_taxonomy_old$ref_MSP[match(msp_taxonomy_all$msp_name,msp_taxonomy_old$msp_id)]
+
+
+# PROLFILES --------------------------------------------------------------------------
+meteor_pro_list <- 
+  list(
+    gut =  read.delim("/projects/shrcan/immunolife/data_9/genes_1/mgs_1/immunolife_vs_hs_10_4_igc2_smart_shared_reads_29032024.downHQ.20000000.fpkm.mgs.100.tsv", header = TRUE, comment.char = '#', sep = '\t', row.names = 1),
+    oral =  read.delim("/projects/shrcan/immunolife/data_10/genes_1/mgs_1/immunolife_vs_hs_8_4_oral_smart_shared_reads_05042024.1.downHQ.20000000.fpkm.mgs.100.tsv", header = TRUE, comment.char = '#', sep = '\t', row.names = 1)
+  )
+
+meteor_pro_list$oral <- meteor_pro_list$oral[,match(colnames(meteor_pro_list$gut), colnames(meteor_pro_list$oral))]
+meteor_pro_list_raw <- 
+  merge_msp_profiles(gut = meteor_pro_list$gut, oral = meteor_pro_list$oral, taxonomy = msp_taxonomy_all, save = FALSE, msp_id = 'msp_name')
+meteor_pro_raw <- meteor_pro_list_raw$profile
+rownames(meteor_pro_raw) <- meteor_pro_raw$id_msp
+meteor_pro_raw$id_msp <- NULL
+meteor_pro_raw <- as.data.frame(t(meteor_pro_raw))
+
+```
+
+### Check for each species/functional module/sample if the functional module has more than 90% of the necessary genes for module activity.
+### If so, consider that the abundance of this functional potential is equivalent to the abundance of the species carrying it.
+
+```{r comp_data, echo = FALSE, message = FALSE, warning = FALSE, eval=T}
+# COMPLETUDE --------------------------------------------------------------------------
+chemin_gut = "/shrcan/immunolife/data_9/genes_1/mgs_1/taxonomy_1/ftmt_1/completude_ind_mgs_mod_data_downHQ_20000000fpkm_ftmt.txt"
+chemin_oral = "/shrcan/immunolife/data_10/genes_1/mgs_1/taxonomy_1/ftmt_1/completude_ind_mgs_mod_data_downHQ_20000000fpkm_ftmt.txt"
+seuil_completude = 0.9
+
+completude = list(gut = setNames(as.data.frame(fread(chemin_gut, header = F, sep = "\t"), stringsAsFactors = F)[,c(1:4)], c("sample", "module", "msp", "complet")),
+                  oral = setNames(as.data.frame(fread(chemin_oral, header = F, sep = "\t"), stringsAsFactors = F)[,c(1:4)], c("sample", "module", "msp", "complet")))
+
+completude = rbind(completude$gut, completude$oral)
+completude = completude[completude$complet >= seuil_completude,] 
+completude$concat = paste(completude$sample, completude$module, completude$msp, sep = "__")
+completude = completude[!duplicated(completude$concat),]
+completude = completude[completude$sample %in% rownames(meteor_pro_raw),]
+completude$sample = factor(completude$sample)
+completude$module = factor(completude$module)
+completude$msp = factor(completude$msp)
+completude$concat_sample_module = factor(paste(completude$sample, completude$module, sep = "__"))
+completude$concat_sample_msp = factor(paste(completude$sample, completude$msp, sep = "__"))
+
+
+
+# Fragmentation de la matrice en plusieurs matrice chacune centré sur un échantillons
+modules = setNames(as.data.frame(matrix(0, nrow = length(unique(completude$sample)), ncol = length(unique(completude$module))), row.names = unique(completude$sample), stringAsFactors = F), unique(completude$module))
+
+for (i in levels(completude$sample)){
+  a = completude[completude$sample ==i,] # table des modules d'un echantillon donnée
+  
+  for (j in unique(a$module)) # pour chaque module de cet echantillon
+  {
+    modules[i,j] = sum(meteor_pro_raw[i, # echantillon en question
+                                                           as.character(a[a$module == j,"msp"]) # les msp d'un module
+                                                           ]
+                       )
+  }
+}
+```
+
+```{r clin_data, echo = FALSE, message = FALSE, warning = FALSE, eval=T}
+# CLMD PARAMETERS
+clmd_retro <-'/projects/immunolife/analysis/data/metadata/rhu_lumiere/n_481_LUNG_TOPO_LONGITUDINAL_20240820.xlsx'
+clmd_pro <- '/projects/immunolife/analysis/data/metadata/immunolife/imnlf1_clmd_E20240424_M20240429.tsv'
+clmd_list <- 
+  list(
+    # retro = read.delim(parameters$paths$clmd_retro, header = TRUE, as.is = TRUE, stringsAsFactors = FALSE),
+    retro = as.data.frame(read_excel(clmd_retro, sheet = 1)),
+    pro = read.delim(clmd_pro, header = TRUE, as.is = TRUE, stringsAsFactors = FALSE)
+  )
+clmd_list$pro$IDMGP <- clmd_list$pro$IDMGP_INRAE
+
+if(!dim(clmd_list$retro)[1] == 482){
+  warning('incorrect retrospective clinical data dimensions: should be 482, while it is:', dim(clmd_list$retro)[1])
+}
+
+clin <- as.data.frame(clmd_list$pro)[, c('IDMGP_INRAE','ATB_before_sample','ATB_60_42_merge')]
+clin <- clin %>% distinct(IDMGP_INRAE, .keep_all = TRUE) 
+clin <- drop_na(clin)
+rownames(clin) <- clin$IDMGP_INRAE
+clin$IDMGP_INRAE <- NULL
+merged_df <- merge(clin, modules, by = "row.names", all = FALSE)
+merged_df$ATB_before_sample <- as.factor(merged_df$ATB_before_sample)
+merged_df$ATB_60_42_merge <- as.factor(merged_df$ATB_60_42_merge)
+
+```
+
+
+
+
+```{r ATB_before_sample_complex plot,echo = FALSE, message = FALSE, warning = FALSE, fig.width = 16, fig.height = 6,results = 'asis',fig.align='center'}
+predictors <- merged_df
+rownames(predictors) <- predictors$Row.names
+predictors$ATB_before_sample <- NULL
+predictors$ATB_60_42_merge <- NULL
+predictors$Row.names <- NULL
+predictors$Status <- merged_df$ATB_before_sample
+predictors$Status <- ifelse(predictors$Status == 0, "After_ATB_Sample", "Before_ATB_Sample")
+
+#sum(apply(predictors,3,is.nan))
+
+#save(predictors, file = "modules_atb_before_sample.RData")
+
+res<-testRelations2(x = t(predictors[,c(1:(ncol(predictors)-1))]),y = predictors$Status,type = "nonparametric",multiple.adjust = "BH")
+res <- drop_na(res)
+res$auc = sapply(rownames(res),
+                 function(x) if(res[x, "After_ATB_Sample.Before_ATB_Sample_status_Cliffdeltacorrected"] == "After_ATB_Sample"){
+                   roc(factor(predictors$Status, levels = c("Before_ATB_Sample", "After_ATB_Sample")),
+                       predictors[[x]], plot = FALSE, direction = "<")$auc
+                 } else if(res[x, "After_ATB_Sample.Before_ATB_Sample_status_Cliffdeltacorrected"] == "Before_ATB_Sample"){
+                   roc(factor(predictors$Status, levels = c("After_ATB_Sample","Before_ATB_Sample")),
+                       predictors[[x]], plot = FALSE, direction = ">")$auc
+                 })
+res_f<-res[which(abs(res$After_ATB_Sample.Before_ATB_Sample_Cliffdelta)>0.15),]
+res_f$logFDR<-(-log10(res_f$q))
+colnames(res_f)[ncol(res_f)]<-"-logFDR"
+res_f$features<-rownames(res_f)
+res_f<-res_f[order(res_f$After_ATB_Sample.Before_ATB_Sample_Cliffdelta,decreasing = F),]
+res_f$features<-factor(x = res_f$features,levels = res_f$features)
+
+#-----------------------PLOTTING PART--------------------------####
+#first plot: stacked boxplot of the abundances in the different groups####
+melt1<-reshape2::melt(data = as.matrix(predictors[,rownames(res_f)]))
+melt1$Status<-predictors[melt1$Var1,"Status"]
+## replace module name by description
+melt1 <- merge(kegg, melt1, by = "Var2", all = FALSE)
+melt1$Var2 <- NULL
+melt1$path <- NULL
+melt1$msps <- NULL
+melt1 %>% rename("Var2" = "desc")
+names(melt1)[names(melt1) == "desc"] <- "Var2"
+melt1 <- melt1 %>% select(Var1, Var2, everything()) #swith
+##
+
+p1<-ggplot(melt1,aes(x = Var2, y=value, colour=Status))+
+  theme_classic2()+
+  geom_boxplot(width=1,position = position_dodge())+
+  geom_point(size=1, position = position_dodge(1))+
+  coord_flip()+
+  theme(legend.title = element_blank(),
+        legend.text = element_text(size = 3),
+        axis.title.x = element_text(size = 7),
+        axis.text.x = element_text(size = 7),
+        axis.ticks.y = element_blank(),
+        axis.line.y = element_blank(),
+        legend.position = c(0.9,0.9))+
+  ggplot2::scale_colour_manual(name="",values = c("#c1ce20","#0cafb7"))+
+  xlab("")+
+  ylab("Abundance")
+#second plot: barplot of the log 10 adj pvalues####
+p2<-ggplot2::ggplot(res_f,aes(x = features,y = `-logFDR`))+
+  ggpubr::theme_classic2()+
+  ggplot2::geom_bar(stat = "identity",colour="black",fill="#606464",width = 0.5)+
+  theme(axis.text.y = element_blank(),axis.ticks.y = element_blank(),axis.line.y = element_blank(),
+        axis.title.x = element_text(size = 7),axis.text.x = element_text(size = 7))+
+  coord_flip()+xlab("")+geom_hline(yintercept = -log10(0.05),color="#c1ce20",size=1)+
+  scale_y_continuous(limits = c(0, 24), breaks = c(seq(0, 24, by = 5),24))
+#third plot: barplot of the Cliffdelta####
+p3<-ggplot2::ggplot(res_f,aes(x = features,y = After_ATB_Sample.Before_ATB_Sample_Cliffdelta,fill=After_ATB_Sample.Before_ATB_Sample_status_Cliffdeltacorrected))+
+  ggpubr::theme_classic2()+
+  ggplot2::geom_bar(stat = "identity")+
+  theme(axis.text.y = element_blank(),axis.ticks.y = element_blank(),axis.line.y = element_blank(),
+        axis.title.x = element_text(size = 7),axis.text.x = element_text(size = 7))+
+  ggplot2::ylab("Effect size")+ggplot2::xlab("") +
+  ggplot2::scale_fill_manual(name="Status",values = c("#c1ce20","#0cafb7"))+guides(fill="none")+
+  ggplot2::coord_flip()
+#fourth plot: stacked barplot of prevalence####
+melt2<-reshape2::melt(data = as.matrix(res_f[,c("After_ATB_Sample_prev","Before_ATB_Sample_prev")]))
+melt2$Status<-predictors[melt2$Var1,"Status"]
+summary(as.factor(predictors$Status))
+melt2$Prev_perc<-NA
+melt2[which(melt2$Var2=="After_ATB_Sample_prev"),"Prev_perc"]<-100*(melt2[which(melt2$Var2=="After_ATB_Sample_prev"),"value"]/114)
+melt2[which(melt2$Var2=="Before_ATB_Sample_prev"),"Prev_perc"]<-100*(melt2[which(melt2$Var2=="Before_ATB_Sample_prev"),"value"]/123)
+
+p4<-ggplot2::ggplot(melt2,aes(x = Var1,y = Prev_perc,fill=Var2))+
+  ggpubr::theme_classic2()+
+  ggplot2::geom_bar(position="dodge", stat="identity", color="black",width = 0.5)+
+  theme(axis.text.y = element_blank(),axis.ticks.y = element_blank(),axis.line.y = element_blank(),
+        axis.title.x = element_text(size = 7),axis.text.x = element_text(size = 7))+
+  ggplot2::ylab("Prevalence [%]")+ggplot2::xlab("") +
+  ggplot2::scale_fill_manual(name="Status",values = c("#c1ce20","#0cafb7"))+guides(fill="none")+
+  ggplot2::coord_flip()
+#fifth plot: lolipop plot of the AUC####
+melt2<-reshape2::melt(data = as.matrix(res_f[,c("After_ATB_Sample_prev","Before_ATB_Sample_prev")]))
+melt2$Status<-predictors[melt2$Var1,"Status"]
+summary(as.factor(predictors$Status))
+melt2$Prev_perc<-NA
+melt2[which(melt2$Var2=="After_ATB_Sample_prev"),"Prev_perc"]<-100*(melt2[which(melt2$Var2=="After_ATB_Sample_prev"),"value"]/114)
+melt2[which(melt2$Var2=="Before_ATB_Sample_prev"),"Prev_perc"]<-100*(melt2[which(melt2$Var2=="Before_ATB_Sample_prev"),"value"]/123)
+
+p5<-ggplot(res_f,aes(x = features,y = auc))+theme_bw()+xlab("")+ylab("")+
+  geom_point(aes(colour=as.factor(sign(auc-0.5))),size = 4,shape=18)+
+  scale_colour_manual(values=c("#0cafb7","#c1ce20"))+
+  theme(axis.text.y = element_blank(),axis.ticks.y = element_blank(),axis.line.y = element_blank(),
+        axis.title.x = element_text(size = 7),axis.text.x = element_text(size = 7))+
+  coord_flip()+ylab("AU-ROC")+geom_hline(yintercept = 0.5,color="#606464")+
+  guides(colour="none")
+
+
+#altogether####
+p<-ggarrange(p1,p2,p3,p4,p5,nrow = 1,widths = c(7,1,1,1,1))
+p <- annotate_figure(p, top = text_grob("ATB_before_sample", face = "bold", size = 14))
+print(p)
+
+ggsave(file="/export/mgps/home/douahbi/functional_analysis/checkassociation_siamcat/ATB_before_sample.jpg", 
+       plot=p,width = 18,height = 10)
+```
+
+```{r}
+install.packages("magick")
+
+library(magick)
+image1 <- magick::image_read("/export/mgps/home/douahbi/functional_analysis/checkassociation_siamcat/ATB_before_sample.jpg")
+image2 <- magick::image_read("/export/mgps/home/douahbi/functional_analysis/checkassociation_siamcat/ATB_60_42_merge.jpg")
+img1 <- ggdraw() + draw_image(image1)
+img2 <- ggdraw() + draw_image(image2)
+
+# Créer une grille avec les deux images côte à côte
+combined_images <- plot_grid(img1, img2, ncol = 2)
+
+# Exporter les images combinées dans un PDF
+ggsave("/export/mgps/home/douahbi/functional_analysis/complex_plot.pdf", combined_images, width = 10, height = 5)
+
+getwd()
+```
+
+
+# ATB_60_42_merge : les modules significativement differents entre les deux groupes
+```{r ATB_60_42_merge,echo = FALSE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 4,results = 'asis',fig.align='center'}
+# Calcul des statistiques descriptives par groupe
+summary_stats <- merged_df %>%
+  group_by(ATB_60_42_merge) %>%
+  summarise(across(starts_with("M"), list(mean = mean, sd = sd), .names = "{col}_{fn}"))
+
+
+# Test t pour chaque module
+generate_plot <- function(module, group="ATB_60_42_merge") {
+  pvalue <- paste0("t-test : ", t_test_results$p_value[which(t_test_results$Module == module)])
+  grob <- grobTree(textGrob(pvalue, x = 0.3, y = 0.80, hjust = 0,
+                            gp = gpar(col = "black", fontsize = 8, fontface = "italic")))
+
+  metab <- kegg$Glycolysis..Embden.Meyerhof.pathway...glucose....pyruvate[which(kegg$M00001 == module)]
+  p <- ggplot(merged_df, aes(x = ATB_60_42_merge, y = get(module), fill = ATB_60_42_merge)) +
+    geom_boxplot(notch = TRUE, outlier.colour = "red", outlier.shape = 8) +
+    labs(title = paste0(metab), y = module, x = group) +
+    geom_jitter(shape = 16, position = position_jitter(0.2)) +
+    theme_minimal() +
+    theme(legend.position = "top",plot.title = element_text(size = 7), axis.title.x = element_text(size = 7),axis.title.y = element_text(size = 7)) +
+    theme(legend.position = "top") +
+    scale_fill_manual(values = c("#999999", "#E69F00")) +
+    guides(fill = guide_legend(title = NULL)) +
+    annotation_custom(grob)
+  return(p)
+}
+t_test_results <- data.frame(Module = character(), p_value = numeric())
+for (module in grep("^M", colnames(merged_df), value = TRUE)) {
+  t_test <- t.test(as.formula(paste(module, "~ ATB_60_42_merge")), data = merged_df)
+  t_test_results <- rbind(t_test_results, data.frame(Module = module, p_value = t_test$p.value))
+}
+length(t_test_results$Module[which(t_test_results$p_value<0.05)])
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][1:4], generate_plot)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][5:8], generate_plot)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][9:12], generate_plot)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][13:16], generate_plot)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][17:20], generate_plot)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][21], generate_plot)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+
+```
+
+# ATB_before_sample : les modules significativement differents entre les deux groupes
+
+```{r ATB_before_sample,echo = FALSE, message = FALSE, warning = FALSE, fig.width = 10, fig.height = 4,results = 'asis',fig.align='center'}
+generate_plot2 <- function(module, group="ATB_before_sample") {
+  pvalue <- paste0("t-test : ", t_test_results$p_value[which(t_test_results$Module == module)])
+  grob <- grobTree(textGrob(pvalue, x = 0.3, y = 0.80, hjust = 0,
+                            gp = gpar(col = "black", fontsize = 8, fontface = "italic")))
+
+  metab <- kegg$Glycolysis..Embden.Meyerhof.pathway...glucose....pyruvate[which(kegg$M00001 == module)]
+  p <- ggplot(merged_df, aes(x = ATB_before_sample, y = get(module), fill = ATB_before_sample)) +
+    geom_boxplot(notch = TRUE, outlier.colour = "red", outlier.shape = 8) +
+    labs(title = paste0(metab), y = module, x = group) +
+    geom_jitter(shape = 16, position = position_jitter(0.2)) +
+    theme_minimal() +
+    theme(legend.position = "top",plot.title = element_text(size = 7), axis.title.x = element_text(size = 7),axis.title.y = element_text(size = 7)) +
+    scale_fill_manual(values = c("#999999", "#E69F00")) +
+    guides(fill = guide_legend(title = NULL)) +
+    annotation_custom(grob)
+  return(p)
+}
+t_test_results <- data.frame(Module = character(), p_value = numeric())
+for (module in grep("^M", colnames(merged_df), value = TRUE)) {
+  t_test <- t.test(as.formula(paste(module, "~ ATB_before_sample")), data = merged_df)
+  t_test_results <- rbind(t_test_results, data.frame(Module = module, p_value = t_test$p.value))
+}
+
+length(t_test_results$Module[which(t_test_results$p_value<0.05)])
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][1:4], generate_plot2)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][5:8], generate_plot2)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][9:12], generate_plot2)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][13:16], generate_plot2)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][17:20], generate_plot2)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+
+plots <- lapply(t_test_results$Module[which(t_test_results$p_value<0.05)][21:22], generate_plot2)
+combined_plot <- plot_grid(plotlist = plots, ncol = 2)
+print(combined_plot)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
